@@ -2,10 +2,7 @@
 // Packages: discord.js, dotenv, express, cors, pg
 
 require("dotenv").config();
-const {
-  Client, GatewayIntentBits,
-  EmbedBuilder, REST, Routes, SlashCommandBuilder,
-} = require("discord.js");
+const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const express = require("express");
 const cors    = require("cors");
 const { Pool } = require("pg");
@@ -59,7 +56,7 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ── Discord job embed helper ──────────────────────────────
+// ── Discord job embed ─────────────────────────────────────
 async function postJobToDiscord(job) {
   if (!JOB_BOARD_CHANNEL) return;
   try {
@@ -73,9 +70,9 @@ async function postJobToDiscord(job) {
           .setTitle(job.title)
           .addFields(
             { name: "🏢 Company",     value: job.company,                                               inline: true  },
-            { name: "💰 Pay Range",   value: job.pay_range    || "Not specified",                       inline: true  },
-            { name: "🔗 Apply",       value: job.url          ? `[Click here](${job.url})` : "No link", inline: true  },
-            { name: "📋 Description", value: job.description  || "No description provided",             inline: false },
+            { name: "💰 Pay Range",   value: job.pay_range   || "Not specified",                        inline: true  },
+            { name: "🔗 Apply",       value: job.url         ? `[Click here](${job.url})` : "No link",  inline: true  },
+            { name: "📋 Description", value: job.description || "No description provided",              inline: false },
           )
           .setColor(color)
           .setFooter({ text: `${roleLabel} • Posted via Dialled Portal` })
@@ -113,7 +110,6 @@ app.get("/api/jobs", requireApiKey, async (req, res) => {
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
-    console.error("GET /api/jobs error:", err);
     res.status(500).json({ error: "Something went wrong" });
   }
 });
@@ -139,10 +135,8 @@ app.post("/api/jobs", requireApiKey, async (req, res) => {
 
     const job = result.rows[0];
     await postJobToDiscord(job);
-
     res.status(201).json({ success: true, job });
   } catch (err) {
-    console.error("POST /api/jobs error:", err);
     res.status(500).json({ error: "Something went wrong" });
   }
 });
@@ -158,17 +152,14 @@ app.patch("/api/jobs/:id/status", requireApiKey, async (req, res) => {
       "UPDATE jobs SET status = $1 WHERE id = $2 RETURNING *",
       [status, req.params.id]
     );
-    if (!result.rows.length) {
-      return res.status(404).json({ error: "Job not found" });
-    }
+    if (!result.rows.length) return res.status(404).json({ error: "Job not found" });
     res.json({ success: true, job: result.rows[0] });
   } catch (err) {
-    console.error("PATCH /api/jobs/:id/status error:", err);
     res.status(500).json({ error: "Something went wrong" });
   }
 });
 
-// GET /api/jobs/all — returns all jobs including filled/expired (admin use)
+// GET /api/jobs/all — all jobs including filled/expired
 app.get("/api/jobs/all", requireApiKey, async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM jobs ORDER BY created_at DESC");
@@ -181,74 +172,7 @@ app.get("/api/jobs/all", requireApiKey, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ API listening on port ${PORT}`));
 
-// ── Discord Bot ───────────────────────────────────────────
+// ── Discord client (post-only, no commands) ───────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-client.once("ready", async () => {
-  console.log(`✅ Discord bot ready: ${client.user.tag}`);
-  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(
-    Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-    {
-      body: [
-        new SlashCommandBuilder()
-          .setName("jobs")
-          .setDescription("View current open roles on the job board"),
-      ].map((c) => c.toJSON()),
-    }
-  );
-});
-
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === "jobs") {
-    await interaction.deferReply();
-
-    const result = await pool.query(`
-      SELECT * FROM jobs
-      WHERE status = 'active'
-        AND (expires_at IS NULL OR expires_at > NOW())
-      ORDER BY created_at DESC
-      LIMIT 10
-    `);
-
-    if (!result.rows.length) {
-      return interaction.editReply({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("💼 Job Board")
-            .setDescription("No open roles right now — check back soon.")
-            .setColor(0xE24B4A)
-            .setFooter({ text: "Post jobs via the Dialled student portal" })
-        ],
-      });
-    }
-
-    const closing = result.rows.filter(j => j.role_type === "closing");
-    const setting = result.rows.filter(j => j.role_type === "setting");
-
-    const format = (jobs) =>
-      jobs.map(j =>
-        `**${j.title}** @ ${j.company}` +
-        `${j.pay_range ? ` · ${j.pay_range}` : ""}` +
-        `${j.url ? ` · [Apply](${j.url})` : ""}`
-      ).join("\n") || "None listed";
-
-    await interaction.editReply({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("💼 Dialled Job Board")
-          .addFields(
-            { name: `🔒 Closing Roles (${closing.length})`, value: format(closing), inline: false },
-            { name: `📞 Setting Roles (${setting.length})`, value: format(setting), inline: false },
-          )
-          .setColor(0xE24B4A)
-          .setFooter({ text: "Post or apply via the Dialled student portal" })
-          .setTimestamp(),
-      ],
-    });
-  }
-});
-
+client.once("ready", () => console.log(`✅ Discord bot ready: ${client.user.tag}`));
 client.login(process.env.DISCORD_TOKEN);
