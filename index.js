@@ -199,7 +199,9 @@ Otherwise respond with exactly these fields:
   "pay_range": "salary, commission or OTE if mentioned, otherwise null",
   "url": "application link or contact method, copied character-for-character exactly as written, otherwise null",
   "description": "a clean 1-3 sentence summary of the role and requirements",
-  "role_type": "closing or setting — closing if they need closers/sales, setting if they need setters/appointment setters, default to closing if unclear"
+  "role_type": "closing or setting — closing if they need closers/sales, setting if they need setters/appointment setters, default to closing if unclear",
+  "monthly_ote": "number or null — the top advertised monthly earnings/OTE as a plain number (e.g. 12000). Convert yearly ÷12 and weekly ×4.33. For a range like $8k–$12k use the top (12000). null if no pay is mentioned",
+  "ote_verified": "true only if the earnings are backed by evidence in the tip (e.g. proof of payouts/income screenshots, named reps currently earning that amount, a stated base + clearly defined commission that adds up to it). false if it's just a claim like 'up to $20k/month' or 'uncapped'"
 }`,
   });
 
@@ -224,11 +226,24 @@ Otherwise respond with exactly these fields:
   return JSON.parse(clean);
 }
 
+// Grade a premium-board offer by monthly OTE:
+//   under $5k/mo              → entry    (green)
+//   $5k up to $15k/mo         → standard (red)
+//   $15k+/mo AND verified OTE → premium  (gold)
+// $15k+ that isn't verified stays standard. No pay listed → standard.
+function gradePremiumTier(job) {
+  const ote = Number(String(job.monthly_ote ?? "").replace(/[^0-9.]/g, ""));
+  if (!ote) return "standard";
+  if (ote < 5000) return "entry";
+  if (ote >= 15000 && job.ote_verified === true) return "premium";
+  return "standard";
+}
+
 // Post a premium job embed to #premium-board
 async function postPremiumJobToDiscord(job, sourceMessage) {
   const channel   = await client.channels.fetch(PREMIUM_BOARD_CHANNEL);
   const roleLabel = job.role_type === "closing" ? "🔒 Closing Role" : "📞 Setting Role";
-  const tier      = TIERS.premium;
+  const tier      = TIERS[job.tier] || TIERS.standard;
 
   const fields = [
     { name: "🏢 Company",     value: clip(job.company || "Unknown", 1024),             inline: true  },
@@ -284,7 +299,7 @@ async function handlePremiumTip(message) {
       job.extra_links = links.slice(1);
     }
 
-    job.tier      = "premium";
+    job.tier      = gradePremiumTier(job);
     job.role_type = job.role_type === "setting" ? "setting" : "closing";
     job.posted_by = `premium-tips:${message.author.username}`;
 
