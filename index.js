@@ -59,6 +59,11 @@ const JOB_BOARD_CHANNEL = process.env.JOB_BOARD_CHANNEL_ID;
 const PORTAL_API_KEY    = process.env.PORTAL_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
+// Premium flow: anything posted in #premium-job-tips (text and/or screenshots,
+// by anyone) is auto-approved and posted straight to #premium-board.
+const PREMIUM_TIPS_CHANNEL  = process.env.PREMIUM_TIPS_CHANNEL_ID;
+const PREMIUM_BOARD_CHANNEL = process.env.PREMIUM_BOARD_CHANNEL_ID;
+
 // ── Tier config ───────────────────────────────────────────
 const TIERS = {
   premium:  { label: "💎 Premium",  color: 0xFFD700, description: "Top paying, competitive roles"    },
@@ -141,6 +146,158 @@ async function postJobToDiscord(job) {
   });
 }
 
+// ── Premium: helpers ──────────────────────────────────────
+const URL_REGEX = /https?:\/\/[^\s<>()\[\]"'`]+/gi;
+
+// Pull links out of the original message exactly as written (minus trailing
+// punctuation and Discord's <...> no-embed wrapper) so they are never rewritten.
+function extractLinksVerbatim(text) {
+  if (!text) return [];
+  const found = text.match(URL_REGEX) || [];
+  return [...new Set(found.map(u => u.replace(/[.,;:!?*_~]+$/, "")))];
+}
+
+function clip(str, max) {
+  if (!str) return str;
+  return str.length > max ? str.slice(0, max - 1) + "…" : str;
+}
+
+function formatApplyField(url) {
+  if (!url) return "No link";
+  if (/^https?:\/\//i.test(url)) return clip(`[Click here](${url})\n${url}`, 1024);
+  return clip(url, 1024); // e.g. "DM @john on IG" — show as plain text
+}
+
+// Ask Claude to turn a premium tip (text and/or images) into a job post.
+async function extractJobFromTip({ text, imageUrls }) {
+  const content = [];
+
+  for (const imageUrl of imageUrls) {
+    const imageRes  = await fetch(imageUrl);
+    const arrayBuf  = await imageRes.arrayBuffer();
+    const mediaType = (imageRes.headers.get("content-type") || "image/png").split(";")[0];
+    content.push({
+      type:   "image",
+      source: { type: "base64", media_type: mediaType, data: Buffer.from(arrayBuf).toString("base64") },
+    });
+  }
+
+  content.push({
+    type: "text",
+    text: `You are converting a job tip posted in a Discord channel into a structured job post.
+The tip may be plain text, one or more screenshots, or both.${text ? `\n\nMessage text:\n"""\n${text}\n"""` : ""}
+
+Respond ONLY with a JSON object, no other text, no markdown backticks.
+
+If the tip clearly contains no job opportunity at all (e.g. casual chat like "thanks" or "lol"), respond with exactly: {"is_job": false}
+
+Otherwise respond with exactly these fields:
+{
+  "is_job": true,
+  "title": "job title or role name",
+  "company": "company or person hiring, use 'Unknown' if not found",
+  "pay_range": "salary, commission or OTE if mentioned, otherwise null",
+  "url": "application link or contact method, copied character-for-character exactly as written, otherwise null",
+  "description": "a clean 1-3 sentence summary of the role and requirements",
+  "role_type": "closing or setting — closing if they need closers/sales, setting if they need setters/appointment setters, default to closing if unclear"
+}`,
+  });
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "x-api-key":         ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model:      "claude-opus-4-5",
+      max_tokens: 1024,
+      messages:   [{ role: "user", content }],
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(`Anthropic API error: ${JSON.stringify(data)}`);
+  const raw   = data.content?.[0]?.text || "";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  return JSON.parse(clean);
+}
+
+// Post a premium job embed to #premium-board
+async function postPremiumJobToDiscord(job, sourceMessage) {
+  const channel   = await client.channels.fetch(PREMIUM_BOARD_CHANNEL);
+  const roleLabel = job.role_type === "closing" ? "🔒 Closing Role" : "📞 Setting Role";
+  const tier      = TIERS.premium;
+
+  const fields = [
+    { name: "🏢 Company",     value: clip(job.company || "Unknown", 1024),             inline: true  },
+    { name: "💰 Pay Range",   value: clip(job.pay_range || "Not specified", 1024),     inline: true  },
+    { name: "🏷️ Tier",        value: tier.label,                                       inline: true  },
+    { name: "🔗 Apply",       value: formatApplyField(job.url),                        inline: false },
+    { name: "📋 Description", value: clip(job.description || "No description provided", 1024), inline: false },
+  ];
+  if (job.extra_links?.length) {
+    fields.push({ name: "🔗 Other Links", value: clip(job.extra_links.join("\n"), 1024), inline: false });
+  }
+
+  await channel.send({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(clip(job.title || "Premium Role", 256))
+        .addFields(fields)
+        .setColor(tier.color)
+        .setFooter({ text: `${roleLabel} • ${tier.label} • Tip from ${sourceMessage.author.username}` })
+        .setTimestamp(),
+    ],
+  });
+}
+
+// Handle a message in #premium-job-tips: extract → save → post. No approval step.
+async function handlePremiumTip(message) {
+  // Support Discord's native "Forward" feature (content lives in messageSnapshots)
+  const snapshots = [...(message.messageSnapshots?.values?.() || [])];
+  const texts = [message.content, ...snapshots.map(s => s.content)].filter(Boolean);
+  const attachments = [
+    ...message.attachments.values(),
+    ...snapshots.flatMap(s => [...(s.attachments?.values?.() || [])]),
+  ];
+
+  const text      = texts.join("\n\n").trim();
+  const imageUrls = attachments.filter(a => a.contentType?.startsWith("image/")).map(a => a.url);
+
+  if (!text && !imageUrls.length) return; // nothing to work with (e.g. sticker)
+
+  await message.react("🔍").catch(() => {});
+
+  try {
+    const job = await extractJobFromTip({ text, imageUrls });
+    await message.reactions.cache.get("🔍")?.users.remove(client.user.id).catch(() => {});
+
+    if (!job.is_job) return; // casual chat — ignore quietly
+
+    // Keep links exactly as they appeared in the tip. If the message text has
+    // a real URL, that wins over anything Claude produced.
+    const links = extractLinksVerbatim(text);
+    if (links.length) {
+      job.url = links[0];
+      job.extra_links = links.slice(1);
+    }
+
+    job.tier      = "premium";
+    job.role_type = job.role_type === "setting" ? "setting" : "closing";
+    job.posted_by = `premium-tips:${message.author.username}`;
+
+    await saveJobToDB(job);
+    await postPremiumJobToDiscord(job, message);
+    await message.react("✅").catch(() => {});
+  } catch (err) {
+    console.error("Premium tip error:", err);
+    await message.reactions.cache.get("🔍")?.users.remove(client.user.id).catch(() => {});
+    await message.react("❌").catch(() => {});
+  }
+}
+
 // ── Save job to database ──────────────────────────────────
 async function saveJobToDB(job) {
   const result = await pool.query(
@@ -203,6 +360,17 @@ const client = new Client({
 
 client.once("ready", () => {
   console.log(`✅ Discord bot ready: ${client.user.tag}`);
+  if (!PREMIUM_TIPS_CHANNEL || !PREMIUM_BOARD_CHANNEL) {
+    console.warn("⚠️ PREMIUM_TIPS_CHANNEL_ID / PREMIUM_BOARD_CHANNEL_ID not set — premium flow disabled");
+  }
+});
+
+// ── Watch #premium-job-tips — auto-approve to #premium-board ──
+client.on("messageCreate", async (message) => {
+  if (!PREMIUM_TIPS_CHANNEL || !PREMIUM_BOARD_CHANNEL) return;
+  if (message.channelId !== PREMIUM_TIPS_CHANNEL) return;
+  if (message.author.id === client.user.id) return; // never loop on our own messages
+  await handlePremiumTip(message);
 });
 
 // ── Watch #job-tips for images ────────────────────────────
