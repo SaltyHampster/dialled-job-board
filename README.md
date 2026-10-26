@@ -12,8 +12,10 @@ Discord bot + API for the Dialled job board (runs on Railway).
 Premium board offers are graded by monthly OTE, with matching embed colours:
 
 - 🌱 Entry (green): under $5k/month
-- 🔥 Standard (red): $5k–$15k/month, $15k+ that isn't verified, or no pay listed
-- 💎 Premium (gold): $15k+/month with verified OTE
+- 🔥 Standard (red): $5k up to $15k/month, or no pay listed
+- 💎 Premium (gold): $15k+/month OTE
+
+Each job in a message is graded on its own, using the top of its stated OTE range. Ticket prices / cash collected are ignored.
 
 Premium tips: the bot reacts 🔍 while reading, ✅ once posted, ❌ if it failed. Casual chat that isn't a job is ignored. Any links in the tip text are posted exactly as written.
 

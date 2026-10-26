@@ -233,12 +233,11 @@ Respond ONLY with one JSON object in this exact shape, no other text, no markdow
       "end_line": "number — last line of this job's block (null if screenshot only)",
       "title": "job title or role name",
       "company": "company, offer or person hiring, use 'Unknown' if not found",
-      "pay_range": "salary, commission or OTE if mentioned, otherwise null",
+      "pay_range": "what the rep earns for THIS job only (OTE, salary, base + commission), written as in the post, e.g. \"$8K to $10K/mo\". Do NOT include ticket prices, cash collected or program prices here. null if not mentioned",
       "url": "application link or contact method for THIS job, copied character-for-character exactly as written, otherwise null",
       "description": "a clean 1-3 sentence summary of this role and its requirements (include ticket price / cash collected if given)",
       "role_type": "closing or setting — closing if they need closers/sales, setting if they need setters/appointment setters, default to closing if unclear",
-      "monthly_ote": "number or null — the top advertised monthly earnings/OTE as a plain number (e.g. 12000). Convert yearly ÷12 and weekly ×4.33. For a range like $8k–$12k use the top (12000). null if no pay is mentioned",
-      "ote_verified": "true only if the earnings are backed by evidence in the tip (e.g. proof of payouts/income screenshots, named reps currently earning that amount, a stated base + clearly defined commission that adds up to it). false if it's just a claim like 'up to $20k/month' or 'uncapped'"
+      "monthly_ote": "number or null — the TOP of this job's advertised monthly earnings/OTE as a plain number with no symbols or commas (e.g. \"$8K to $10K/mo\" → 10000, \"$15k-25k\" → 25000). Convert yearly ÷12 and weekly ×4.33. Never use ticket prices, cash collected or program prices — only what the rep earns. null if this job states no earnings figure"
     }
   ]
 }
@@ -271,16 +270,34 @@ If the tip contains no job opportunity at all (e.g. casual chat like "thanks" or
   return jobs.filter(j => j && j.title && j.is_job !== false);
 }
 
+// Read the highest monthly earnings figure out of free text like
+// "$8K to $10K/mo", "15k-25k OTE", "$120,000/yr", "$2.5k per week".
+function parseMonthlyOte(str) {
+  if (str === null || str === undefined) return null;
+  if (typeof str === "number") return str > 0 ? str : null;
+  const t = String(str).toLowerCase().replace(/,/g, "");
+  const nums = [...t.matchAll(/\$?\s*(\d+(?:\.\d+)?)\s*(k|m)?\b/g)]
+    .map(m => parseFloat(m[1]) * (m[2] === "k" ? 1000 : m[2] === "m" ? 1000000 : 1))
+    .filter(n => n >= 500); // ignore stray small numbers (e.g. "10%", "2 years")
+  if (!nums.length) return null;
+  let top = Math.max(...nums);
+  if (/(\/|per|a|an)\s*(yr|year|annum)|annual|yearly|p\.?a\.?\b/.test(t)) top /= 12;
+  else if (/(\/|per|a)\s*(wk|week)|weekly/.test(t)) top *= 4.33;
+  return Math.round(top);
+}
+
 // Grade a premium-board offer by monthly OTE:
-//   under $5k/mo              → entry    (green)
-//   $5k up to $15k/mo         → standard (red)
-//   $15k+/mo AND verified OTE → premium  (gold)
-// $15k+ that isn't verified stays standard. No pay listed → standard.
+//   under $5k/mo     → entry    (green)
+//   $5k up to $15k   → standard (red)
+//   $15k+/mo         → premium  (gold)
+// No earnings figure at all → standard.
 function gradePremiumTier(job) {
-  const ote = Number(String(job.monthly_ote ?? "").replace(/[^0-9.]/g, ""));
+  // Prefer our own reading of the pay text; fall back to the AI's number
+  const ote = parseMonthlyOte(job.pay_range) ?? parseMonthlyOte(job.monthly_ote);
+  job.monthly_ote = ote;
   if (!ote) return "standard";
   if (ote < 5000) return "entry";
-  if (ote >= 15000 && job.ote_verified === true) return "premium";
+  if (ote >= 15000) return "premium";
   return "standard";
 }
 
@@ -382,6 +399,7 @@ async function handlePremiumTip(message) {
       job.tier      = gradePremiumTier(job);
       job.role_type = job.role_type === "setting" ? "setting" : "closing";
       job.posted_by = `premium-tips:${message.author.username}`;
+      console.log(`Premium tip graded: "${job.title}" | pay: ${job.pay_range} | monthly OTE: ${job.monthly_ote} → ${job.tier}`);
 
       // Post first so a DB hiccup never blocks the board
       await postPremiumJobToDiscord(job, message);
