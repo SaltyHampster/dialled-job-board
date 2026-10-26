@@ -171,8 +171,31 @@ function formatApplyField(url) {
   return clip(url, 1024); // e.g. "DM @john on IG" — show as plain text
 }
 
-// Ask Claude to turn a premium tip (text and/or images) into a job post.
-async function extractJobFromTip({ text, imageUrls }) {
+// Pull every top-level {...} object out of a model reply, ignoring any text
+// around them. Handles one object, an object holding a "jobs" array, or
+// several objects back to back.
+function parseJsonObjects(raw) {
+  const objects = [];
+  let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") { if (depth++ === 0) start = i; }
+    else if (ch === "}" && depth > 0 && --depth === 0) {
+      try { objects.push(JSON.parse(raw.slice(start, i + 1))); } catch { /* skip bad chunk */ }
+    }
+  }
+  return objects;
+}
+
+// Ask Claude to split a premium tip (text and/or images) into one or more job posts.
+async function extractJobsFromTip({ text, imageUrls }) {
   const content = [];
 
   for (const imageUrl of imageUrls) {
@@ -185,27 +208,42 @@ async function extractJobFromTip({ text, imageUrls }) {
     });
   }
 
+  // Number the lines so Claude can say exactly where each job starts and stops
+  const numbered = text
+    ? text.split("\n").map((line, i) => `${String(i + 1).padStart(3, " ")}| ${line}`).join("\n")
+    : "";
+
   content.push({
     type: "text",
-    text: `You are converting a job tip posted in a Discord channel into a structured job post.
-The tip may be plain text, one or more screenshots, or both.${text ? `\n\nMessage text:\n"""\n${text}\n"""` : ""}
+    text: `You are converting job tips posted in a Discord channel into structured job posts.
+The tip may be plain text, one or more screenshots, or both.
 
-Respond ONLY with a JSON object, no other text, no markdown backticks.
+IMPORTANT: a single tip often contains SEVERAL separate jobs. Recruiters post each job as its own block of roughly 3-8 lines (usually starting with a heading like "Hiring Closer:" / "Setter needed" / a company or offer name, followed by OTE, ticket price, requirements, link, etc.), then the next job starts underneath. Split the tip into one entry per distinct job. Never merge two jobs into one entry, and never split one job into two.${numbered ? `
 
-If the tip clearly contains no job opportunity at all (e.g. casual chat like "thanks" or "lol"), respond with exactly: {"is_job": false}
+Message text (line numbers on the left are for reference only, they are not part of the text):
+"""
+${numbered}
+"""` : ""}
 
-Otherwise respond with exactly these fields:
+Respond ONLY with one JSON object in this exact shape, no other text, no markdown backticks:
 {
-  "is_job": true,
-  "title": "job title or role name",
-  "company": "company or person hiring, use 'Unknown' if not found",
-  "pay_range": "salary, commission or OTE if mentioned, otherwise null",
-  "url": "application link or contact method, copied character-for-character exactly as written, otherwise null",
-  "description": "a clean 1-3 sentence summary of the role and requirements",
-  "role_type": "closing or setting — closing if they need closers/sales, setting if they need setters/appointment setters, default to closing if unclear",
-  "monthly_ote": "number or null — the top advertised monthly earnings/OTE as a plain number (e.g. 12000). Convert yearly ÷12 and weekly ×4.33. For a range like $8k–$12k use the top (12000). null if no pay is mentioned",
-  "ote_verified": "true only if the earnings are backed by evidence in the tip (e.g. proof of payouts/income screenshots, named reps currently earning that amount, a stated base + clearly defined commission that adds up to it). false if it's just a claim like 'up to $20k/month' or 'uncapped'"
-}`,
+  "jobs": [
+    {
+      "start_line": "number — first line of this job's block in the message text (null if the job only appears in a screenshot)",
+      "end_line": "number — last line of this job's block (null if screenshot only)",
+      "title": "job title or role name",
+      "company": "company, offer or person hiring, use 'Unknown' if not found",
+      "pay_range": "salary, commission or OTE if mentioned, otherwise null",
+      "url": "application link or contact method for THIS job, copied character-for-character exactly as written, otherwise null",
+      "description": "a clean 1-3 sentence summary of this role and its requirements (include ticket price / cash collected if given)",
+      "role_type": "closing or setting — closing if they need closers/sales, setting if they need setters/appointment setters, default to closing if unclear",
+      "monthly_ote": "number or null — the top advertised monthly earnings/OTE as a plain number (e.g. 12000). Convert yearly ÷12 and weekly ×4.33. For a range like $8k–$12k use the top (12000). null if no pay is mentioned",
+      "ote_verified": "true only if the earnings are backed by evidence in the tip (e.g. proof of payouts/income screenshots, named reps currently earning that amount, a stated base + clearly defined commission that adds up to it). false if it's just a claim like 'up to $20k/month' or 'uncapped'"
+    }
+  ]
+}
+
+If the tip contains no job opportunity at all (e.g. casual chat like "thanks" or "lol"), respond with exactly: {"jobs": []}`,
   });
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -217,17 +255,20 @@ Otherwise respond with exactly these fields:
     },
     body: JSON.stringify({
       model:      "claude-opus-4-5",
-      max_tokens: 1024,
+      max_tokens: 8000,
       messages:   [{ role: "user", content }],
     }),
   });
 
   const data = await response.json();
   if (!response.ok) throw new Error(`Anthropic API error ${response.status}: ${data.error?.message || JSON.stringify(data)}`);
-  const raw   = data.content?.[0]?.text || "";
-  const match = raw.match(/\{[\s\S]*\}/); // tolerate any text around the JSON
-  if (!match) throw new Error("AI didn't return job details");
-  return JSON.parse(match[0]);
+  const raw = data.content?.map(c => c.text || "").join("") || "";
+
+  const objects = parseJsonObjects(raw);
+  if (!objects.length) throw new Error("AI didn't return job details");
+  // Accept {"jobs":[...]} or loose job objects back to back
+  const jobs = objects.flatMap(o => Array.isArray(o.jobs) ? o.jobs : (o.title ? [o] : []));
+  return jobs.filter(j => j && j.title && j.is_job !== false);
 }
 
 // Grade a premium-board offer by monthly OTE:
@@ -272,7 +313,8 @@ async function postPremiumJobToDiscord(job, sourceMessage) {
   });
 }
 
-// Handle a message in #premium-job-tips: extract → save → post. No approval step.
+// Handle a message in #premium-job-tips: split into jobs → post each → save.
+// No approval step.
 async function handlePremiumTip(message) {
   // Support Discord's native "Forward" feature (content lives in messageSnapshots)
   const snapshots = [...(message.messageSnapshots?.values?.() || [])];
@@ -288,34 +330,73 @@ async function handlePremiumTip(message) {
   if (!text && !imageUrls.length) return; // nothing to work with (e.g. sticker)
 
   await message.react("🔍").catch(() => {});
+  const clearSearching = () => message.reactions.cache.get("🔍")?.users.remove(client.user.id).catch(() => {});
 
+  let jobs;
   try {
-    const job = await extractJobFromTip({ text, imageUrls });
-    await message.reactions.cache.get("🔍")?.users.remove(client.user.id).catch(() => {});
-
-    if (!job.is_job) return; // casual chat — ignore quietly
-
-    // Keep links exactly as they appeared in the tip. If the message text has
-    // a real URL, that wins over anything Claude produced.
-    const links = extractLinksVerbatim(text);
-    if (links.length) {
-      job.url = links[0];
-      job.extra_links = links.slice(1);
-    }
-
-    job.tier      = gradePremiumTier(job);
-    job.role_type = job.role_type === "setting" ? "setting" : "closing";
-    job.posted_by = `premium-tips:${message.author.username}`;
-
-    // Post first so a DB hiccup never blocks the board
-    await postPremiumJobToDiscord(job, message);
-    await message.react("✅").catch(() => {});
-    await saveJobToDB(job).catch(err => console.error("Premium tip DB save failed (posted anyway):", err));
+    jobs = await extractJobsFromTip({ text, imageUrls });
   } catch (err) {
-    console.error("Premium tip error:", err);
-    await message.reactions.cache.get("🔍")?.users.remove(client.user.id).catch(() => {});
+    console.error("Premium tip extraction error:", err);
+    await clearSearching();
     await message.react("❌").catch(() => {});
-    await message.reply(`❌ Couldn't post this to the premium board: ${clip(err.message || String(err), 300)}`).catch(() => {});
+    await message.reply(`❌ Couldn't read this tip: ${clip(err.message || String(err), 300)}`).catch(() => {});
+    return;
+  }
+  await clearSearching();
+  if (!jobs.length) return; // casual chat — ignore quietly
+
+  // Links are always taken verbatim from the original message, scoped to each
+  // job's own block of lines so they never get attached to the wrong job.
+  const lines       = text.split("\n");
+  const allLinks    = extractLinksVerbatim(text);
+  const claimed     = new Set();
+  for (const job of jobs) {
+    const s = parseInt(job.start_line, 10), e = parseInt(job.end_line, 10);
+    if (s >= 1 && e >= s) {
+      job._links = extractLinksVerbatim(lines.slice(s - 1, e).join("\n"));
+      job._links.forEach(l => claimed.add(l));
+    } else {
+      job._links = [];
+    }
+  }
+  // Links outside every job block (e.g. one "apply here" link at the bottom)
+  // are shared with any job that has no link of its own.
+  const shared = allLinks.filter(l => !claimed.has(l));
+
+  let posted = 0;
+  const failures = [];
+  for (const job of jobs) {
+    try {
+      let links = job._links.length ? job._links : shared;
+      // If Claude's link appears verbatim in the message, keep it first
+      if (job.url && links.includes(job.url)) links = [job.url, ...links.filter(l => l !== job.url)];
+      if (links.length) {
+        job.url         = links[0];
+        job.extra_links = links.slice(1);
+      } else if (job.url && /^https?:\/\//i.test(job.url) && !text.includes(job.url) && text) {
+        // Claude produced a URL that isn't in the message text — don't trust it
+        job.url = null;
+      }
+      delete job._links;
+
+      job.tier      = gradePremiumTier(job);
+      job.role_type = job.role_type === "setting" ? "setting" : "closing";
+      job.posted_by = `premium-tips:${message.author.username}`;
+
+      // Post first so a DB hiccup never blocks the board
+      await postPremiumJobToDiscord(job, message);
+      posted++;
+      await saveJobToDB(job).catch(err => console.error("Premium tip DB save failed (posted anyway):", err));
+    } catch (err) {
+      console.error(`Premium tip post error (${job.title}):`, err);
+      failures.push(`${job.title}: ${err.message || err}`);
+    }
+  }
+
+  if (posted) await message.react("✅").catch(() => {});
+  if (failures.length) {
+    await message.react("❌").catch(() => {});
+    await message.reply(clip(`❌ Posted ${posted}/${jobs.length} jobs. Failed:\n• ${failures.join("\n• ")}`, 1900)).catch(() => {});
   }
 }
 
