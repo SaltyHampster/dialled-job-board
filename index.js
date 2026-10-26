@@ -61,8 +61,11 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 // Premium flow: anything posted in #premium-job-tips (text and/or screenshots,
 // by anyone) is auto-approved and posted straight to #premium-board.
-const PREMIUM_TIPS_CHANNEL  = process.env.PREMIUM_TIPS_CHANNEL_ID;
-const PREMIUM_BOARD_CHANNEL = process.env.PREMIUM_BOARD_CHANNEL_ID;
+// IDs come from Railway env vars; if those are missing, the bot finds the
+// channels by name on startup (e.g. "premium-job-tips" / "premium-board").
+const cleanId = (v) => (v || "").replace(/[^0-9]/g, "") || null; // strips spaces, quotes, <#...>
+let PREMIUM_TIPS_CHANNEL  = cleanId(process.env.PREMIUM_TIPS_CHANNEL_ID);
+let PREMIUM_BOARD_CHANNEL = cleanId(process.env.PREMIUM_BOARD_CHANNEL_ID);
 
 // ── Tier config ───────────────────────────────────────────
 const TIERS = {
@@ -220,10 +223,11 @@ Otherwise respond with exactly these fields:
   });
 
   const data = await response.json();
-  if (!response.ok) throw new Error(`Anthropic API error: ${JSON.stringify(data)}`);
+  if (!response.ok) throw new Error(`Anthropic API error ${response.status}: ${data.error?.message || JSON.stringify(data)}`);
   const raw   = data.content?.[0]?.text || "";
-  const clean = raw.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
+  const match = raw.match(/\{[\s\S]*\}/); // tolerate any text around the JSON
+  if (!match) throw new Error("AI didn't return job details");
+  return JSON.parse(match[0]);
 }
 
 // Grade a premium-board offer by monthly OTE:
@@ -303,13 +307,15 @@ async function handlePremiumTip(message) {
     job.role_type = job.role_type === "setting" ? "setting" : "closing";
     job.posted_by = `premium-tips:${message.author.username}`;
 
-    await saveJobToDB(job);
+    // Post first so a DB hiccup never blocks the board
     await postPremiumJobToDiscord(job, message);
     await message.react("✅").catch(() => {});
+    await saveJobToDB(job).catch(err => console.error("Premium tip DB save failed (posted anyway):", err));
   } catch (err) {
     console.error("Premium tip error:", err);
     await message.reactions.cache.get("🔍")?.users.remove(client.user.id).catch(() => {});
     await message.react("❌").catch(() => {});
+    await message.reply(`❌ Couldn't post this to the premium board: ${clip(err.message || String(err), 300)}`).catch(() => {});
   }
 }
 
@@ -373,17 +379,58 @@ const client = new Client({
   ],
 });
 
-client.once("ready", () => {
-  console.log(`✅ Discord bot ready: ${client.user.tag}`);
-  if (!PREMIUM_TIPS_CHANNEL || !PREMIUM_BOARD_CHANNEL) {
-    console.warn("⚠️ PREMIUM_TIPS_CHANNEL_ID / PREMIUM_BOARD_CHANNEL_ID not set — premium flow disabled");
+// Find a text channel across all servers the bot is in, by name keywords
+function findChannelByName(test) {
+  for (const guild of client.guilds.cache.values()) {
+    const ch = guild.channels.cache.find(c => c.isTextBased?.() && test(c.name.toLowerCase()));
+    if (ch) return ch.id;
   }
+  return null;
+}
+
+async function checkPremiumSetup() {
+  if (!PREMIUM_TIPS_CHANNEL) {
+    PREMIUM_TIPS_CHANNEL = findChannelByName(n => n.includes("premium") && n.includes("tip"));
+    if (PREMIUM_TIPS_CHANNEL) console.log(`ℹ️ PREMIUM_TIPS_CHANNEL_ID not set — found tips channel by name: ${PREMIUM_TIPS_CHANNEL}`);
+  }
+  if (!PREMIUM_BOARD_CHANNEL) {
+    PREMIUM_BOARD_CHANNEL = findChannelByName(n => n.includes("premium") && n.includes("board"));
+    if (PREMIUM_BOARD_CHANNEL) console.log(`ℹ️ PREMIUM_BOARD_CHANNEL_ID not set — found board channel by name: ${PREMIUM_BOARD_CHANNEL}`);
+  }
+  if (!PREMIUM_TIPS_CHANNEL || !PREMIUM_BOARD_CHANNEL) {
+    console.warn(`⚠️ Premium flow DISABLED — tips channel: ${PREMIUM_TIPS_CHANNEL || "NOT FOUND"}, board channel: ${PREMIUM_BOARD_CHANNEL || "NOT FOUND"}. Set PREMIUM_TIPS_CHANNEL_ID and PREMIUM_BOARD_CHANNEL_ID in Railway.`);
+    return;
+  }
+
+  // Verify the bot can actually see/post in both channels
+  const needs = {
+    [PREMIUM_TIPS_CHANNEL]:  ["ViewChannel", "ReadMessageHistory", "AddReactions", "SendMessages"],
+    [PREMIUM_BOARD_CHANNEL]: ["ViewChannel", "SendMessages", "EmbedLinks"],
+  };
+  for (const [id, perms] of Object.entries(needs)) {
+    try {
+      const ch      = await client.channels.fetch(id);
+      const missing = perms.filter(p => !ch.permissionsFor(client.user)?.has(p));
+      if (missing.length) console.warn(`⚠️ Bot is missing permissions in #${ch.name}: ${missing.join(", ")}`);
+      else console.log(`✅ Premium channel OK: #${ch.name} (${id})`);
+    } catch (err) {
+      console.warn(`⚠️ Bot can't access channel ${id} — wrong ID or the bot can't see it: ${err.message}`);
+    }
+  }
+}
+
+client.once("ready", async () => {
+  console.log(`✅ Discord bot ready: ${client.user.tag}`);
+  await checkPremiumSetup().catch(err => console.error("Premium setup check failed:", err));
 });
 
 // ── Watch #premium-job-tips — auto-approve to #premium-board ──
 client.on("messageCreate", async (message) => {
   if (!PREMIUM_TIPS_CHANNEL || !PREMIUM_BOARD_CHANNEL) return;
-  if (message.channelId !== PREMIUM_TIPS_CHANNEL) return;
+  // Match the channel itself, or a thread/forum post inside it
+  const inTips = message.channelId === PREMIUM_TIPS_CHANNEL
+              || message.channel?.parentId === PREMIUM_TIPS_CHANNEL;
+  if (!inTips) return;
   if (message.author.id === client.user.id) return; // never loop on our own messages
   await handlePremiumTip(message);
 });
