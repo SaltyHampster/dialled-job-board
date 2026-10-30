@@ -237,6 +237,7 @@ Respond ONLY with one JSON object in this exact shape, no other text, no markdow
       "url": "application link or contact method for THIS job, copied character-for-character exactly as written, otherwise null",
       "description": "a clean 1-3 sentence summary of this role and its requirements (include ticket price / cash collected if given)",
       "role_type": "closing or setting — closing if they need closers/sales, setting if they need setters/appointment setters, default to closing if unclear",
+      "is_australian": "true if THIS job is an Australian-based offer — e.g. Australian (AEST/AEDT/AWST/ACST) hours or time zone, Australian company or clients, pay in AUD, mentions Australia/Aus/Aussie or an Australian city or state, or Australian residents only. false otherwise",
       "monthly_ote": "number or null — the TOP of this job's advertised monthly earnings/OTE as a plain number with no symbols or commas (e.g. \"$8K to $10K/mo\" → 10000, \"$15k-25k\" → 25000). Convert yearly ÷12 and weekly ×4.33. Never use ticket prices, cash collected or program prices — only what the rep earns. null if this job states no earnings figure"
     }
   ]
@@ -301,6 +302,12 @@ function gradePremiumTier(job) {
   return "standard";
 }
 
+// Clear signs a job is Australian-based (time zones, AUD, places, "Aus only")
+const AUS_REGEX = /\b(aus|aussies?|australia|australians?|aest|aedt|awst|acst|acdt|aud|sydney|melbourne|brisbane|perth|adelaide|canberra|hobart|darwin|gold coast|nsw|qld)\b|\bA\$|🇦🇺/i;
+function isAustralianText(str) {
+  return !!str && AUS_REGEX.test(str);
+}
+
 // Post a premium job embed to #premium-board
 async function postPremiumJobToDiscord(job, sourceMessage) {
   const channel   = await client.channels.fetch(PREMIUM_BOARD_CHANNEL);
@@ -318,16 +325,17 @@ async function postPremiumJobToDiscord(job, sourceMessage) {
     fields.push({ name: "🔗 Other Links", value: clip(job.extra_links.join("\n"), 1024), inline: false });
   }
 
-  await channel.send({
-    embeds: [
-      new EmbedBuilder()
-        .setTitle(clip(job.title || "Premium Role", 256))
-        .addFields(fields)
-        .setColor(tier.color)
-        .setFooter({ text: `${roleLabel} • ${tier.label} • Tip from ${sourceMessage.author.username}` })
-        .setTimestamp(),
-    ],
-  });
+  const embed = new EmbedBuilder()
+    .setTitle(clip(`${job.is_australian ? "🇦🇺 AUS | " : ""}${job.title || "Premium Role"}`, 256))
+    .addFields(fields)
+    .setColor(tier.color)
+    .setFooter({ text: `${roleLabel} • ${tier.label} • Tip from ${sourceMessage.author.username}` })
+    .setTimestamp();
+
+  // AUS label sits at the very top of the embed, above the title
+  if (job.is_australian) embed.setAuthor({ name: "🇦🇺 AUS OFFER — Australian hours / based" });
+
+  await channel.send({ embeds: [embed] });
 }
 
 // Handle a message in #premium-job-tips: split into jobs → post each → save.
@@ -370,7 +378,8 @@ async function handlePremiumTip(message) {
   for (const job of jobs) {
     const s = parseInt(job.start_line, 10), e = parseInt(job.end_line, 10);
     if (s >= 1 && e >= s) {
-      job._links = extractLinksVerbatim(lines.slice(s - 1, e).join("\n"));
+      job._block = lines.slice(s - 1, e).join("\n");
+      job._links = extractLinksVerbatim(job._block);
       job._links.forEach(l => claimed.add(l));
     } else {
       job._links = [];
@@ -396,10 +405,15 @@ async function handlePremiumTip(message) {
       }
       delete job._links;
 
+      // AUS flag: Claude's judgement OR a clear Australian keyword in this job's own text
+      const ownText = job._block || (jobs.length === 1 ? text : "");
+      job.is_australian = job.is_australian === true || job.is_australian === "true" || isAustralianText(ownText);
+      delete job._block;
+
       job.tier      = gradePremiumTier(job);
       job.role_type = job.role_type === "setting" ? "setting" : "closing";
       job.posted_by = `premium-tips:${message.author.username}`;
-      console.log(`Premium tip graded: "${job.title}" | pay: ${job.pay_range} | monthly OTE: ${job.monthly_ote} → ${job.tier}`);
+      console.log(`Premium tip graded: "${job.title}" | pay: ${job.pay_range} | monthly OTE: ${job.monthly_ote} → ${job.tier}${job.is_australian ? " | AUS" : ""}`);
 
       // Post first so a DB hiccup never blocks the board
       await postPremiumJobToDiscord(job, message);
