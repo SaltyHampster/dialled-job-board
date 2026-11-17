@@ -17,7 +17,7 @@ Premium board offers are graded by monthly OTE, with matching embed colours:
 
 Each job in a message is graded on its own, using the top of its stated OTE range. Ticket prices / cash collected are ignored.
 
-Premium tips: the bot reacts 🔍 while reading, ✅ once posted, ❌ if it failed. Casual chat that isn't a job is ignored. Any links in the tip text are posted exactly as written.
+Premium tips: the bot reacts 🔍 while reading, ✅ once posted, ❌ if it failed. Casual chat that isn't a job is ignored. Any links in the tip text are posted exactly as written. If a job has an application code (e.g. "Code: CLOSER24", "use code DIALLED"), it's shown exactly as written in the bottom-right of that job's embed as 🔑 Application Code.
 
 ## Environment variables
 

@@ -160,6 +160,61 @@ function extractLinksVerbatim(text) {
   return [...new Set(found.map(u => u.replace(/[.,;:!?*_~]+$/, "")))];
 }
 
+// ── Premium: application codes ───────────────────────────
+// Backup for when Claude misses a code that is plainly written in the text,
+// e.g. "Code: CLOSER24", "use code DIALLED", "password - sales2026",
+// "referral code is AB12". Needs a separator (: = - is) or "use/enter/mention
+// code" so ordinary sentences like "no code needed" don't match.
+const CODE_REGEXES = [
+  // "Code: X" / "password is X" — the separator makes intent clear
+  { re: /\b(?:application|app|apply|referral|ref|access|promo|invite|discount|secret)?\s*(?:code|passcode|password|keyword)\s*(?:is|:|=|-|–|—)\s*(["'`*_]*)([A-Za-z0-9][A-Za-z0-9_-]{1,39})/i, strict: false },
+  // "use code X" — only if X looks like a code (so "we use code review" is ignored)
+  { re: /\b(?:use|enter|mention|include|put|type|comment|quote)\s+(?:the\s+)?(?:code|passcode|password|keyword)\s+(["'`*_]*)([A-Za-z0-9][A-Za-z0-9_-]{1,39})/i, strict: true },
+];
+const CODE_STOPWORDS = new Set(["is", "the", "a", "an", "to", "in", "on", "at", "for", "and", "or", "no", "none", "needed", "required", "below", "above", "here", "there", "when", "if", "that", "this", "your", "you"]);
+
+// Has a digit, is in CAPS, or was wrapped in quotes / bold / backticks
+const looksLikeCode = (code, wrapper) => !!wrapper || /\d/.test(code) || (code.length >= 3 && code === code.toUpperCase());
+
+function findCodeInText(str) {
+  if (!str) return null;
+  for (const { re, strict } of CODE_REGEXES) {
+    const m = str.match(re);
+    if (!m) continue;
+    const [, wrapper, code] = m;
+    if (CODE_STOPWORDS.has(code.toLowerCase())) continue;
+    if (strict && !looksLikeCode(code, wrapper)) continue;
+    return code;
+  }
+  return null;
+}
+
+// Return the code exactly as it is written in the original text (same
+// capitalisation), or null if it isn't in the text at all.
+function findVerbatim(needle, haystack) {
+  if (!needle || !haystack) return null;
+  const i = haystack.toLowerCase().indexOf(needle.toLowerCase());
+  return i === -1 ? null : haystack.slice(i, i + needle.length);
+}
+
+// Decide the final code for one job. Claude's answer is kept only if it
+// really appears in the tip (or the tip has screenshots it could have come
+// from); otherwise fall back to a plainly written "Code: XYZ" in the job's
+// own lines.
+function resolveApplicationCode(job, { ownText, fullText, hasImages }) {
+  let code = typeof job.application_code === "string" ? job.application_code.trim() : null;
+  if (code && /^(null|none|n\/a|no)$/i.test(code)) code = null;
+  if (code) code = code.replace(/^["'`*_]+|["'`*_.,;:!?]+$/g, "");
+
+  if (code) {
+    const verbatim = findVerbatim(code, ownText) || findVerbatim(code, fullText);
+    if (verbatim) return verbatim;
+    if (hasImages) return code; // probably read off a screenshot
+    code = null;                // not in the message — don't trust it
+  }
+  return findCodeInText(ownText);
+}
+
 function clip(str, max) {
   if (!str) return str;
   return str.length > max ? str.slice(0, max - 1) + "…" : str;
@@ -235,6 +290,7 @@ Respond ONLY with one JSON object in this exact shape, no other text, no markdow
       "company": "company, offer or person hiring, use 'Unknown' if not found",
       "pay_range": "what the rep earns for THIS job only (OTE, salary, base + commission), written as in the post, e.g. \"$8K to $10K/mo\". Do NOT include ticket prices, cash collected or program prices here. null if not mentioned",
       "url": "application link or contact method for THIS job, copied character-for-character exactly as written, otherwise null",
+      "application_code": "a code the applicant must enter or mention when applying for THIS job (e.g. an application code, referral code, access code, password, or a keyword like \"comment DIALLED\" / \"mention code CLOSER24 in your application\"), copied character-for-character exactly as written with the same capitalisation, just the code itself with no surrounding words. null if there is no code",
       "description": "a clean 1-3 sentence summary of this role and its requirements (include ticket price / cash collected if given)",
       "role_type": "closing or setting — closing if they need closers/sales, setting if they need setters/appointment setters, default to closing if unclear",
       "is_australian": "true if THIS job is an Australian-based offer — e.g. Australian (AEST/AEDT/AWST/ACST) hours or time zone, Australian company or clients, pay in AUD, mentions Australia/Aus/Aussie or an Australian city or state, or Australian residents only. false otherwise",
@@ -324,6 +380,17 @@ async function postPremiumJobToDiscord(job, sourceMessage) {
   if (job.extra_links?.length) {
     fields.push({ name: "🔗 Other Links", value: clip(job.extra_links.join("\n"), 1024), inline: false });
   }
+  // Application code goes in the bottom-right corner: a final row of three
+  // inline fields where the first two are blank, so the code sits in the
+  // right-hand column on the last line of the embed.
+  if (job.application_code) {
+    const blank = { name: "​", value: "​", inline: true };
+    fields.push(
+      blank,
+      blank,
+      { name: "🔑 Application Code", value: clip(`\`${job.application_code}\``, 1024), inline: true },
+    );
+  }
 
   const embed = new EmbedBuilder()
     .setTitle(clip(`${job.is_australian ? "🇦🇺 AUS | " : ""}${job.title || "Premium Role"}`, 256))
@@ -408,12 +475,15 @@ async function handlePremiumTip(message) {
       // AUS flag: Claude's judgement OR a clear Australian keyword in this job's own text
       const ownText = job._block || (jobs.length === 1 ? text : "");
       job.is_australian = job.is_australian === true || job.is_australian === "true" || isAustralianText(ownText);
+
+      // Application code (if any), taken exactly as written in the tip
+      job.application_code = resolveApplicationCode(job, { ownText, fullText: text, hasImages: imageUrls.length > 0 });
       delete job._block;
 
       job.tier      = gradePremiumTier(job);
       job.role_type = job.role_type === "setting" ? "setting" : "closing";
       job.posted_by = `premium-tips:${message.author.username}`;
-      console.log(`Premium tip graded: "${job.title}" | pay: ${job.pay_range} | monthly OTE: ${job.monthly_ote} → ${job.tier}${job.is_australian ? " | AUS" : ""}`);
+      console.log(`Premium tip graded: "${job.title}" | pay: ${job.pay_range} | monthly OTE: ${job.monthly_ote} → ${job.tier}${job.is_australian ? " | AUS" : ""}${job.application_code ? ` | code: ${job.application_code}` : ""}`);
 
       // Post first so a DB hiccup never blocks the board
       await postPremiumJobToDiscord(job, message);
